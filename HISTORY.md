@@ -1,6 +1,11 @@
 # History / Changelog
 
 
+## Unreleased
+
+- `UrlStore`: opt-in lease mode (`lease_mode=True`) with `claim_url()`, `claim_download_urls()`, `confirm_url()` and `release_url()`; claims return a token and keep the URL unvisited until confirmation, so failed or expired fetches can be re-crawled
+
+
 ## 1.4.0
 
 - More robust `FIND_LINKS_REGEX` expression by @danishashko (#130)

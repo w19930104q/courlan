@@ -50,6 +50,7 @@ store.find_known_urls('http://münchen.de')
 | `strict=True` | Apply stricter URL filtering on add |
 | `trailing_slash=True` | Preserve trailing slashes (set to `False` to strip them) |
 | `verbose=True` | Dump unvisited URLs on SIGINT/SIGTERM (POSIX only, main thread only; replaces existing handlers) |
+| `lease_mode=True` | Hand out token-based leases instead of marking URLs visited on draw (see [Lease mode](#lease-mode-reliable-re-crawling-of-failed-urls)) |
 
 ```python
 filtered_store = UrlStore(language='en', strict=True, compressed=True)
@@ -191,6 +192,92 @@ periodically, and prefer compressed mode for long runs.
 arbitrary code when loading. Only load files you have written yourself
 or that you trust. Consider exporting via `dump_urls()` for sharing.
 ```
+
+
+## Lease mode: reliable re-crawling of failed URLs
+
+The classic download methods (`get_url()`, `get_download_urls()`,
+`establish_download_schedule()`) mark a URL visited the moment it is handed
+out. If the fetch then fails, that URL is never tried again. Construct the
+store with `lease_mode=True` to switch to a claim/confirm workflow: a claim
+returns the URL together with an opaque token and leaves the URL unvisited
+until the token is confirmed.
+
+```python
+store = UrlStore(lease_mode=True)
+store.add_urls(['https://example.org/1', 'https://example.org/2'])
+
+# claim a URL: it is reserved to this token but still counts as unvisited
+url, token = store.claim_url('https://example.org')
+# ('https://example.org/1', '9f2c…')
+
+try:
+    fetch(url)
+except FetchError:
+    store.release_url(token)   # give it back, it can be claimed again
+else:
+    store.confirm_url(token)   # only now is the URL marked visited
+```
+
+### Claims, tokens and expiration
+
+- `claim_url(domain, lease_duration=300)` returns a `(url, token)` pair, or
+  `None` when the domain currently has no claimable URL.
+- A URL under a live lease is never handed out twice, so concurrent workers
+  cannot draw the same URL: each URL has at most one valid token at a time.
+- `confirm_url(token)` marks the URL visited and returns `True`. An unknown,
+  already-used or expired token returns `False` and changes nothing.
+- `release_url(token)` frees the URL for another attempt while keeping it
+  unvisited; it returns `False` for an invalid token.
+- Every lease has a lifetime (`lease_duration` seconds, default
+  `DEFAULT_LEASE_DURATION = 300`). Once it expires the URL becomes claimable
+  again and the old token can no longer be confirmed or released — a
+  confirmation that arrives late is simply ignored.
+- While URLs are in flight (leased but not confirmed) they still belong to
+  the unvisited set, so `done` stays `False` and the domain remains listed by
+  `get_unvisited_domains()`.
+
+### Bulk claims with host rotation
+
+`claim_download_urls()` is the lease-mode counterpart of
+`get_download_urls()`: it keeps the same rotation across hosts and the same
+per-host `time_limit`, measured from the moment of each claim, and returns a
+list of `(url, token)` pairs.
+
+```python
+claims = store.claim_download_urls(time_limit=10, max_urls=50)
+for url, token in claims:
+    try:
+        fetch(url)
+    except FetchError:
+        store.release_url(token)
+    else:
+        store.confirm_url(token)
+```
+
+In lease mode the consumption-style methods `get_url()`,
+`get_download_urls()` and `establish_download_schedule()` raise
+`RuntimeError`; conversely the claim/confirm methods raise `RuntimeError` on
+a store built without `lease_mode`. A store without the option behaves
+exactly as before.
+
+### Persistence and invalidation
+
+- Saving and reloading keeps the confirmed progress, while every URL that was
+  still leased stays unvisited and keeps its place in the queue, so it is
+  offered again by the next claims. **All tokens issued before the load become
+  invalid**, including those that had not expired; workers must re-claim after
+  a restart.
+- `reset()` empties the store and invalidates every outstanding token.
+- `discard()` voids the selected hosts, HTTP/HTTPS twins included, and
+  invalidates their tokens.
+- When an HTTP and an HTTPS entry for the same host are merged, outstanding
+  leases follow onto the surviving key and their tokens remain valid; if both
+  twins held the same path, the duplicate lease is dropped so only one valid
+  token remains.
+- Pickles written by older courlan versions load unchanged, with lease mode
+  off and an empty lease table.
+- Compressed and uncompressed stores behave identically in lease mode.
 
 
 ## Thread safety

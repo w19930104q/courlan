@@ -87,6 +87,38 @@ for delay, url in schedule:
 ```
 
 
+## Lease mode: retrying failed fetches
+
+The methods above mark a URL visited as soon as it is drawn, so a failed
+download is lost. Build the store with `lease_mode=True` to claim URLs with a
+token instead: the URL stays unvisited until the token is confirmed, and can
+be released or simply left to expire for another attempt. The consumption
+methods (`get_url()`, `get_download_urls()`,
+`establish_download_schedule()`) are then disabled.
+
+```python
+from courlan import UrlStore
+
+store = UrlStore(lease_mode=True)
+store.add_urls(['https://a.com/1', 'https://a.com/2', 'https://b.org/x'])
+
+# bulk claims keep the host rotation and the per-host interval
+for url, token in store.claim_download_urls(time_limit=10):
+    try:
+        # response = requests.get(url, timeout=10)
+        store.confirm_url(token)       # success: mark visited
+    except Exception:
+        store.release_url(token)       # failure: requeue for another worker
+```
+
+A claim that neither gets confirmed nor released becomes claimable again once
+its lease duration (default 300 seconds) elapses; the stale token is then
+rejected. Tokens also survive an HTTP/HTTPS merge of the same host, while
+`reset()`, `discard()` and a save/reload cycle invalidate them. See the
+[lease mode section](urlstore.md#lease-mode-reliable-re-crawling-of-failed-urls)
+of the URL store guide for the full semantics.
+
+
 ## Frontier management
 
 ### Scope detection

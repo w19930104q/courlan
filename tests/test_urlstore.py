@@ -10,7 +10,7 @@ import sys
 import threading
 import uuid
 from collections import Counter, defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import sleep
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
@@ -18,13 +18,16 @@ from urllib.robotparser import RobotFileParser
 import pytest
 
 import courlan
+import courlan.urlstore as urlstore_module
 from courlan import UrlStore, load_store
 from courlan.urlstore import (
     _NEAR,
+    DEFAULT_LEASE_DURATION,
     HAS_BZ2,
     HAS_ZLIB,
     Compressor,
     DomainEntry,
+    Lease,
     State,
     UrlPathTuple,
 )
@@ -1327,3 +1330,611 @@ def test_draw_past_long_visited_run():
     assert store.get_url("https://a.org") == "https://a.org/150"
     store.add_urls([f"https://a.org/{i}" for i in range(200)], visited=True)
     assert store.get_url("https://a.org") is None
+
+
+# --- lease mode ---------------------------------------------------------
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    "Pin the store clock to a fixed instant and return its mutable holder."
+    holder = {"now": datetime(2026, 1, 1, 12, 0, 0)}
+    monkeypatch.setattr(urlstore_module, "_now", lambda: holder["now"])
+    return holder
+
+
+def test_lease_mode_defaults_off():
+    "The store stays on the classic consumption API unless lease_mode is set."
+    store = UrlStore()
+    assert store._lease_mode is False and store._leases == {} and store._leased == set()
+    for method in ("claim_url", "claim_download_urls", "confirm_url", "release_url"):
+        with pytest.raises(RuntimeError):
+            getattr(store, method)("token")
+    # classic API still works
+    store.add_urls(["https://a.org/1"])
+    assert store.get_url("https://a.org") == "https://a.org/1"
+    assert store.get_download_urls() == []
+    assert store.establish_download_schedule() == []
+
+
+def test_lease_mode_rejects_consumption_api():
+    "Old consumption-style entries refuse to run instead of silently visiting."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1"])
+    with pytest.raises(RuntimeError):
+        store.get_url("https://a.org")
+    with pytest.raises(RuntimeError):
+        store.get_download_urls()
+    with pytest.raises(RuntimeError):
+        store.establish_download_schedule()
+    # nothing was consumed
+    assert store.find_unvisited_urls("https://a.org") == ["https://a.org/1"]
+
+
+def test_claim_confirm_basic(frozen_clock):
+    "A claim returns URL and token, only the confirmation marks it visited."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://a.org/2"])
+    claim = store.claim_url("https://a.org")
+    assert claim is not None
+    url, token = claim
+    assert url == "https://a.org/1" and isinstance(token, str) and token
+    entry = store.urldict["https://a.org"]
+    assert entry.count == 1 and entry.timestamp == frozen_clock["now"]
+    # in-flight URLs still belong to the unvisited set
+    assert store.find_unvisited_urls("https://a.org") == [
+        "https://a.org/1",
+        "https://a.org/2",
+    ]
+    assert store.has_been_visited(url) is False
+    assert ("https://a.org", "/1") in store._leased
+    assert store.confirm_url(token) is True
+    assert store.has_been_visited(url)
+    assert ("https://a.org", "/1") not in store._leased
+    assert store.find_unvisited_urls("https://a.org") == ["https://a.org/2"]
+
+
+def test_invalid_and_duplicate_tokens_rejected(frozen_clock):
+    "Unknown, duplicate and expired tokens are rejected without state change."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://a.org/2"])
+    url, token = store.claim_url("https://a.org")
+    # unknown token
+    assert store.confirm_url("deadbeef") is False
+    assert store.release_url("deadbeef") is False
+    assert ("https://a.org", "/1") in store._leased
+    # a second confirmation with the same token is refused
+    assert store.confirm_url(token) is True
+    assert store.confirm_url(token) is False
+    assert store.release_url(token) is False
+    assert store.has_been_visited(url)
+    # released tokens cannot be reused either
+    _, token2 = store.claim_url("https://a.org")
+    assert store.release_url(token2) is True
+    assert store.confirm_url(token2) is False
+    assert store.release_url(token2) is False
+
+
+def test_release_allows_reclaim(frozen_clock):
+    "Releasing a claim puts the URL back, unvisited, into the claimable set."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/only"])
+    _, token = store.claim_url("https://a.org")
+    assert store.claim_url("https://a.org") is None  # leased out, no other URL
+    assert store.release_url(token) is True
+    assert store.find_unvisited_urls("https://a.org") == ["https://a.org/only"]
+    claim = store.claim_url("https://a.org")
+    assert claim is not None and claim[0] == "https://a.org/only"
+    assert claim[1] != token  # a fresh lease, the old token stays invalid
+
+
+def test_failed_fetch_reclaim_cycle(frozen_clock):
+    "End-to-end failure handling: claim, failed fetch, release, claim, confirm."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/flaky"])
+    first = store.claim_url("https://a.org")
+    assert first[0] == "https://a.org/flaky"
+    # the fetch fails: the worker gives the claim back
+    assert store.release_url(first[1]) is True
+    assert not store.has_been_visited("https://a.org/flaky")
+    # another worker can pick the very same URL
+    second = store.claim_url("https://a.org")
+    assert second[0] == "https://a.org/flaky" and second[1] != first[1]
+    assert store.confirm_url(second[1]) is True
+    assert store.has_been_visited("https://a.org/flaky")
+    assert store.claim_url("https://a.org") is None
+
+
+def test_lease_expiration(frozen_clock):
+    "Expired leases free their URLs and their tokens are refused."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://a.org/2"])
+    first = store.claim_url("https://a.org", lease_duration=30)
+    second = store.claim_url("https://a.org", lease_duration=30)
+    assert [c[0] for c in (first, second)] == [
+        "https://a.org/1",
+        "https://a.org/2",
+    ]
+    assert store.claim_url("https://a.org") is None
+    # exactly at the expiration instant the lease is over
+    frozen_clock["now"] += timedelta(seconds=30)
+    reclaimed = store.claim_url("https://a.org", lease_duration=30)
+    assert reclaimed is not None and reclaimed[0] == "https://a.org/1"
+    # the stale token is rejected and changes nothing
+    assert store.confirm_url(first[1]) is False
+    assert store.release_url(first[1]) is False
+    assert ("https://a.org", "/1") in store._leased  # held by the new lease
+    # a late confirmation after expiry is impossible even if no one reclaimed
+    frozen_clock["now"] += timedelta(seconds=60)
+    assert store.confirm_url(second[1]) is False
+    assert store.has_been_visited("https://a.org/2") is False
+
+
+def test_late_confirmation_does_not_resurrect(frozen_clock):
+    "A confirmation arriving after another lease took over cannot double-write."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/x"])
+    _, stale = store.claim_url("https://a.org", lease_duration=10)
+    frozen_clock["now"] += timedelta(seconds=11)
+    current = store.claim_url("https://a.org")
+    assert current[0] == "https://a.org/x"
+    assert store.confirm_url(stale) is False
+    assert store.confirm_url(current[1]) is True
+    assert len(store._leases) == 0 and store._leased == set()
+
+
+def test_inflight_keeps_store_open(frozen_clock):
+    "done cannot flip True while unconfirmed URLs are still in flight."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1"])
+    assert store.done is False
+    claim = store.claim_url("https://a.org")
+    assert claim is not None and store.done is False
+    assert store.get_unvisited_domains() == ["https://a.org"]
+    assert store.confirm_url(claim[1]) is True
+    assert store.done is True
+    assert store.get_unvisited_domains() == []
+    # a released URL reopens the finished store
+    store.add_urls(["https://b.org/1"])
+    pending = store.claim_url("https://b.org")
+    assert store.done is False
+    assert store.release_url(pending[1]) is True
+    assert store.get_unvisited_domains() == ["https://b.org"]
+
+
+def test_claim_interval_and_rotation(frozen_clock):
+    "Bulk claims keep the host rotation and measure the interval from the claim."
+    store = UrlStore(lease_mode=True)
+    store.add_urls([f"https://d{i}.org/{j}" for i in range(3) for j in range(2)])
+    first = store.claim_download_urls(time_limit=10, max_urls=2)
+    assert [url for url, _ in first] == ["https://d0.org/0", "https://d1.org/0"]
+    # d0/d1 were just served, d2 is free; rotation continues after d1
+    frozen_clock["now"] += timedelta(seconds=1)
+    second = store.claim_download_urls(time_limit=10, max_urls=2)
+    assert [url for url, _ in second] == ["https://d2.org/0"]
+    # still within the interval: nothing new
+    assert store.claim_download_urls(time_limit=10) == []
+    # strictly past the interval the hosts rotate back to d0 and d1
+    frozen_clock["now"] += timedelta(seconds=10)
+    third = store.claim_download_urls(time_limit=10, max_urls=10)
+    assert [url for url, _ in third] == ["https://d0.org/1", "https://d1.org/1"]
+    # d2 was served one second later, so it waits one more second
+    assert store.claim_download_urls(time_limit=10) == []
+    frozen_clock["now"] += timedelta(seconds=1)
+    fourth = store.claim_download_urls(time_limit=10, max_urls=10)
+    assert [url for url, _ in fourth] == ["https://d2.org/1"]
+    # every URL carries a distinct valid token and stays unvisited
+    tokens = [token for _, token in first + second + third + fourth]
+    assert len(tokens) == len(set(tokens)) == 6
+    assert len(store._leased) == 6
+    assert store.total_url_number() == 6
+    assert all(
+        not u.visited
+        for key in store.urldict
+        for u in store._load_urls(key)
+    )
+
+
+def test_leased_urls_skipped_by_bulk_claims(frozen_clock):
+    "Hosts whose URLs are all leased out yield nothing until a lease ends."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://b.org/1"])
+    store.claim_url("https://a.org", lease_duration=5)
+    frozen_clock["now"] += timedelta(seconds=1)
+    claims = store.claim_download_urls(time_limit=0)
+    assert [url for url, _ in claims] == ["https://b.org/1"]
+    # once the a.org lease expires it is served again
+    frozen_clock["now"] += timedelta(seconds=5)
+    claims = store.claim_download_urls(time_limit=0)
+    assert [url for url, _ in claims] == ["https://a.org/1"]
+
+
+def test_concurrent_claims_single_lease(frozen_clock):
+    "Threads racing for one host produce one valid lease per URL, no duplicates."
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        store = UrlStore(lease_mode=True)
+        store.add_urls([f"https://a.org/{i}" for i in range(200)])
+        claims: list[tuple[str, str]] = []
+        errors = []
+
+        def worker() -> None:
+            try:
+                for _ in range(200):
+                    claim = store.claim_url("https://a.org", lease_duration=1000)
+                    if claim is not None:
+                        claims.append(claim)
+            except Exception as err:  # pragma: no cover
+                errors.append(err)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert errors == []
+    # exactly one lease per URL, every token unique
+    assert len(claims) == 200
+    assert len({url for url, _ in claims}) == 200
+    assert len({token for _, token in claims}) == 200
+    assert set(store._leased) == {
+        ("https://a.org", f"/{i}") for i in range(200)
+    }
+    # concurrent confirmations of the same token: exactly one succeeds
+    token = claims[0][1]
+    outcomes = []
+
+    def confirm() -> None:
+        outcomes.append(store.confirm_url(token))
+
+    runners = [threading.Thread(target=confirm) for _ in range(8)]
+    for thread in runners:
+        thread.start()
+    for thread in runners:
+        thread.join()
+    assert outcomes.count(True) == 1 and outcomes.count(False) == 7
+
+
+def test_lease_parity_compressed(frozen_clock):
+    "Compressed and plain stores behave identically across a full lease cycle."
+    sequences = []
+    for compressed in (False, True):
+        store = UrlStore(compressed=compressed, lease_mode=True)
+        store.add_urls(["https://a.org/1", "https://a.org/2", "https://b.org/x"])
+        seen = []
+        first = store.claim_download_urls(time_limit=0, lease_duration=30)
+        seen.append(sorted(url for url, _ in first))
+        frozen_clock["now"] += timedelta(seconds=1)
+        second = store.claim_download_urls(time_limit=0, lease_duration=30)
+        seen.append(sorted(url for url, _ in second))
+        # confirm one, release one, let one expire
+        assert store.confirm_url(first[0][1]) is True
+        assert store.release_url(second[0][1]) is True
+        frozen_clock["now"] += timedelta(seconds=40)
+        third = store.claim_download_urls(time_limit=0)
+        seen.append(sorted(url for url, _ in third))
+        for _url, token in third:
+            assert store.confirm_url(token) is True
+        seen.append(store.done)
+        seen.append(sorted(store.dump_urls()))
+        sequences.append(seen)
+    assert sequences[0] == sequences[1]
+
+
+def test_twin_merge_keeps_lease_valid(frozen_clock):
+    "HTTP/HTTPS canonicalization preserves outstanding leases and their tokens."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["http://h.org/a", "http://h.org/b"])
+    claim = store.claim_url("http://h.org", lease_duration=100)
+    assert claim[0] == "http://h.org/a"
+    # introducing the https twin merges the entries under https
+    store.add_urls(["https://h.org/c"])
+    assert "http://h.org" not in store.urldict
+    assert ("https://h.org", "/a") in store._leased
+    lease = store._leases[claim[1]]
+    assert lease.domain == "https://h.org" and lease.path == "/a"
+    # the token issued before the merge still confirms the URL
+    assert store.confirm_url(claim[1]) is True
+    assert store.has_been_visited("http://h.org/a")
+    nxt = store.claim_url("https://h.org")
+    assert nxt[0] == "https://h.org/b"
+    assert store.confirm_url(nxt[1]) is True
+    # a claim on the merged-away twin key resolves to the surviving entry
+    assert store.claim_url("http://h.org")[0] == "https://h.org/c"
+
+
+def test_twin_merge_dedupes_shared_path(frozen_clock):
+    "Coexisting twins holding the same path keep a single valid lease."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["http://dup.com/shared", "http://dup.com/http-only"])
+    http_claim = store.claim_url("http://dup.com", lease_duration=100)
+    assert http_claim[0] == "http://dup.com/shared"
+    # build a legacy-style coexisting https twin
+    entry = store.urldict.pop("http://dup.com")
+    store.add_urls(["https://dup.com/shared", "https://dup.com/https-only"])
+    store.urldict["http://dup.com"] = entry
+    https_claim = store.claim_url("https://dup.com", lease_duration=100)
+    assert https_claim[0] == "https://dup.com/https-only"
+    # the next addition triggers the twin merge
+    store.add_urls(["https://dup.com/more"])
+    assert "http://dup.com" not in store.urldict
+    # the pre-merge token still confirms the shared URL exactly once
+    assert store.confirm_url(http_claim[1]) is True
+    assert store.confirm_url(http_claim[1]) is False
+    assert store.confirm_url(https_claim[1]) is True
+
+
+def test_discard_invalidates_leases(frozen_clock):
+    "Discarding a host (or its twin) voids every related token."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["http://y.org/a", "https://y.org/b", "https://z.org/1"])
+    y_claim = store.claim_url("http://y.org", lease_duration=100)
+    z_claim = store.claim_url("https://z.org", lease_duration=100)
+    store.discard(["https://y.org"])
+    assert store.confirm_url(y_claim[1]) is False
+    assert store.release_url(y_claim[1]) is False
+    assert not any(lease.domain == "https://y.org" for lease in store._leases.values())
+    # the other host is untouched
+    assert store.confirm_url(z_claim[1]) is True
+    # discarded hosts stay discarded and produce no claims
+    assert store.claim_url("http://y.org") is None
+
+
+def test_reset_invalidates_leases(frozen_clock):
+    "A reset drops every lease and all previously issued tokens."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://b.org/1"])
+    claims = store.claim_download_urls(time_limit=0)
+    tokens = [token for _, token in claims]
+    store.reset()
+    assert store._leases == {} and store._leased == set()
+    for token in tokens:
+        assert store.confirm_url(token) is False
+        assert store.release_url(token) is False
+
+
+def test_lease_persistence_roundtrip(tmp_path, frozen_clock):
+    "Saving and loading keeps confirmed progress, requeues pending URLs, kills tokens."
+    for compressed in (False, True):
+        store = UrlStore(compressed=compressed, lease_mode=True)
+        store.add_urls([f"https://x.org/{i}" for i in range(4)])
+        done = store.claim_url("https://x.org", lease_duration=100)
+        assert store.confirm_url(done[1]) is True
+        pending = store.claim_url("https://x.org", lease_duration=100)
+        assert pending[0] == "https://x.org/1"
+        path = str(tmp_path / f"store-{compressed}.pickle")
+        store.write(path)
+        loaded = load_store(path)
+        assert loaded._lease_mode is True
+        assert loaded._leases == {} and loaded._leased == set()
+        # confirmed progress survives, in-flight URLs are unvisited again
+        assert loaded.has_been_visited("https://x.org/0")
+        assert sorted(loaded.find_unvisited_urls("https://x.org")) == [
+            f"https://x.org/{i}" for i in range(1, 4)
+        ]
+        # every pre-load token is invalid
+        assert loaded.confirm_url(pending[1]) is False
+        assert loaded.release_url(pending[1]) is False
+        # the requeued URL leads the next claims and can complete
+        claim = loaded.claim_url("https://x.org")
+        assert claim[0] == "https://x.org/1"
+        assert loaded.confirm_url(claim[1]) is True
+
+
+def test_legacy_pickle_loads_in_lease_mode_compatible(tmp_path):
+    "Pickles written before lease mode load cleanly and keep the classic API."
+    store = UrlStore(compressed=True)
+    store.add_urls(["https://old.org/a"])
+    state = store.__getstate__()
+    assert "_leases" not in state and "_leased" not in state
+    legacy = UrlStore.__new__(UrlStore)
+    legacy.__setstate__(state)
+    assert legacy._lease_mode is False
+    assert legacy._leases == {} and legacy._leased == set()
+    assert legacy.get_url("https://old.org") == "https://old.org/a"
+    # enabling lease mode on a loaded store works from a clean slate
+    legacy._lease_mode = True
+    legacy.add_urls(["https://old.org/b"])
+    claim = legacy.claim_url("https://old.org")
+    assert claim[0] == "https://old.org/b"
+    assert legacy.confirm_url(claim[1]) is True
+
+
+def test_lease_objects_and_default_duration():
+    "Lease value objects track their lifetime and the default duration is exposed."
+    assert DEFAULT_LEASE_DURATION == 300.0
+    start = datetime(2026, 1, 1)
+    lease = Lease("tok", "https://a.org", "/x", start + timedelta(seconds=10))
+    assert lease.is_expired(start) is False
+    assert lease.is_expired(start + timedelta(seconds=10)) is True
+    assert lease.is_expired(start + timedelta(seconds=11)) is True
+
+
+def test_claim_collection_and_state_accounting(frozen_clock):
+    "Claim sets and counters stay coherent across claims, confirms and releases."
+    store = UrlStore(lease_mode=True)
+    store.add_urls([f"https://a.org/{i}" for i in range(5)])
+    claims = [store.claim_url("https://a.org", lease_duration=100) for _ in range(3)]
+    assert all(claims)
+    entry = store.urldict["https://a.org"]
+    assert entry.count == 3
+    assert len(store._leases) == len(store._leased) == 3
+    assert store.get_all_counts() == [3]
+    # releasing does not rewrite the download counter
+    store.release_url(claims[0][1])
+    assert entry.count == 3 and len(store._leases) == 2
+    # the released URL is claimable again
+    again = store.claim_url("https://a.org", lease_duration=100)
+    assert again[0] == claims[0][0] and again[1] != claims[0][1]
+    # drain everything: confirm the four live claims, reclaim the last URL
+    for claim in claims[1:]:
+        assert store.confirm_url(claim[1]) is True
+    assert store.confirm_url(again[1]) is True
+    last = store.claim_url("https://a.org")
+    assert last[0] == "https://a.org/3"
+    assert store.confirm_url(last[1]) is True
+    tail = store.claim_url("https://a.org")
+    assert tail[0] == "https://a.org/4"
+    assert store.confirm_url(tail[1]) is True
+    assert store.done is True
+    assert store._leases == {} and store._leased == set()
+    assert store.total_url_number() == 5
+
+
+def test_claim_unknown_domain(frozen_clock):
+    "Claiming an unknown or non-OPEN domain yields None without creating entries."
+    store = UrlStore(lease_mode=True)
+    assert store.claim_url("https://unknown.org") is None
+    assert not store.urldict
+    store.add_urls(["https://a.org/1"])
+    claim = store.claim_url("https://a.org")
+    assert claim is not None
+    store.confirm_url(claim[1])
+    # exhausted domain yields nothing
+    assert store.claim_url("https://a.org") is None
+    # and a bulk sweep over the same exhausted host stays empty
+    assert store.claim_download_urls(time_limit=0) == []
+
+
+def test_expired_token_cleanup_path(frozen_clock):
+    "An expired token used in confirm/release is swept and reported invalid."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://a.org/2"])
+    stale = store.claim_url("https://a.org", lease_duration=5)
+    # another live lease keeps the host busy; expiry only matters on token use
+    frozen_clock["now"] += timedelta(seconds=6)
+    assert store.confirm_url(stale[1]) is False
+    assert stale[1] not in store._leases
+    # same path through release_url
+    other = store.claim_url("https://a.org", lease_duration=5)
+    frozen_clock["now"] += timedelta(seconds=6)
+    assert store.release_url(other[1]) is False
+    assert other[1] not in store._leases
+
+
+def test_confirm_after_discard_invalid(frozen_clock):
+    "A confirmation against a voided domain is refused after removing its lease."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://b.org/1"])
+    a_claim = store.claim_url("https://a.org", lease_duration=100)
+    b_claim = store.claim_url("https://b.org", lease_duration=100)
+    store.discard(["https://a.org"])
+    assert store.confirm_url(a_claim[1]) is False
+    # the unaffected host still completes
+    assert store.confirm_url(b_claim[1]) is True
+
+
+def test_confirm_missing_path_after_dedup(frozen_clock):
+    "A token whose path vanished from the store cannot confirm anything."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1"])
+    _, token = store.claim_url("https://a.org", lease_duration=100)
+    lease = store._leases[token]
+    # simulate the path no longer being present under the stored domain,
+    # dropping the hot path index which otherwise still references it
+    entry = store.urldict[lease.domain]
+    store._freeze()
+    entry.tuples = deque()
+    entry.total = 0
+    assert store.confirm_url(token) is False
+    assert token not in store._leases  # the lease itself was consumed
+
+
+def test_release_reopens_finished_domain(frozen_clock):
+    "Releasing the last in-flight URL reopens an ALL_VISITED domain and clears done."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1"])
+    _, token = store.claim_url("https://a.org", lease_duration=100)
+    entry = store.urldict["https://a.org"]
+    entry.state = State.ALL_VISITED
+    store.done = True
+    assert store.release_url(token) is True
+    assert entry.state is State.OPEN
+    assert store.done is False
+    assert store.get_unvisited_domains() == ["https://a.org"]
+
+
+def test_legacy_pickle_missing_lease_slot():
+    "A pickled state without lease slots restores lease mode off."
+    store = UrlStore()
+    store.add_urls(["https://old.org/a"])
+    state = store.__getstate__()
+    del state["_lease_mode"]
+    restored = UrlStore.__new__(UrlStore)
+    restored.__setstate__(state)
+    assert restored._lease_mode is False
+    assert restored._leases == {} and restored._leased == set()
+
+
+def test_bulk_claim_skips_busted_and_none_entries(frozen_clock):
+    "Bulk claims tolerate entries that disappear or are voided during the sweep."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1", "https://b.org/1"])
+    store.discard(["https://b.org"])
+    # no exception, only the OPEN host can be served
+    claims = store.claim_download_urls(time_limit=0)
+    assert [url for url, _ in claims] == ["https://a.org/1"]
+
+
+def test_rekey_lease_collision_drops_duplicate(frozen_clock):
+    "Merging twins that both lease the same path keeps a single valid token."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["http://dup.com/shared", "http://dup.com/http-only"])
+    # detach the http entry and build a coexisting https twin (legacy state)
+    http_entry = store.urldict.pop("http://dup.com")
+    store.add_urls(["https://dup.com/shared", "https://dup.com/https-only"])
+    store.urldict["http://dup.com"] = http_entry
+    # place a live lease on each twin for the same normalized path,
+    # bypassing claim_url() which would merge the twins on entry
+    now = frozen_clock["now"]
+    http_token, https_token = "http-token", "https-token"
+    store._leases[http_token] = Lease(
+        http_token, "http://dup.com", "/shared", now + timedelta(seconds=100)
+    )
+    store._leases[https_token] = Lease(
+        https_token, "https://dup.com", "/shared", now + timedelta(seconds=100)
+    )
+    store._leased.update(
+        {("http://dup.com", "/shared"), ("https://dup.com", "/shared")}
+    )
+    # the next addition canonicalizes and merges the twins
+    store.add_urls(["https://dup.com/more"])
+    assert "http://dup.com" not in store.urldict
+    # only one lease remains for the shared path and it is the https one
+    assert store._leased == {("https://dup.com", "/shared")}
+    assert https_token in store._leases
+    assert http_token not in store._leases
+    assert store.confirm_url(http_token) is False
+    assert store.confirm_url(https_token) is True
+
+
+def test_confirm_against_busted_entry_refused(frozen_clock):
+    "A lease whose entry is voided out of band cannot confirm, and is dropped."
+    store = UrlStore(lease_mode=True)
+    store.add_urls(["https://a.org/1"])
+    _, token = store.claim_url("https://a.org", lease_duration=100)
+    # void the entry while keeping the lease on record (defensive state)
+    store._bust(store.urldict["https://a.org"])
+    assert store.confirm_url(token) is False
+    assert token not in store._leases and store._leased == set()
+
+
+def test_get_url_on_busted_domain_sets_done():
+    "Drawing from a voided domain returns None and lets the store settle done."
+    store = UrlStore()
+    store.add_urls(["https://a.org/1"])
+    store._bust(store.urldict["https://a.org"])
+    assert store.get_url("https://a.org") is None
+    assert store.done is True
+
+
+def test_discard_non_http_key_in_lease_mode(frozen_clock):
+    "Discarding a non-http(s) key still voids it and settles the store."
+    store = UrlStore(lease_mode=True)
+    store._store_urls("ftp://example.org", deque())
+    store.discard(["ftp://example.org"])
+    assert store.urldict["ftp://example.org"].state is State.BUSTED
+    assert store.done is True

@@ -32,6 +32,7 @@ from operator import itemgetter
 from threading import RLock
 from typing import Any
 from urllib.robotparser import RobotFileParser
+from uuid import uuid4
 
 from .clean import normalize_and_split, normalize_netloc_parts
 from .core import filter_links
@@ -40,6 +41,14 @@ from .meta import clear_caches
 from .urlutils import _parse, _slash_variant, _swap_scheme, get_base_url
 
 LOGGER = logging.getLogger(__name__)
+
+# default lifetime of a lease, in seconds
+DEFAULT_LEASE_DURATION = 300.0
+
+
+def _now() -> datetime:
+    "Return the current time, patched by the fixed-clock tests."
+    return datetime.now()
 
 
 def _decompress(data: bytes) -> bytes:
@@ -128,6 +137,22 @@ class UrlPathTuple:
         return self.urlpath.decode("utf-8")
 
 
+class Lease:
+    "A claim on an unvisited URL, identified by an opaque token."
+
+    __slots__ = ("token", "domain", "path", "expires")
+
+    def __init__(self, token: str, domain: str, path: str, expires: datetime) -> None:
+        self.token: str = token
+        self.domain: str = domain
+        self.path: str = path
+        self.expires: datetime = expires
+
+    def is_expired(self, now: datetime) -> bool:
+        "Tell if the lease has run out at the given time."
+        return now >= self.expires
+
+
 PathIndex = dict[str, UrlPathTuple]
 
 # positions checked by index before _first_unvisited walks the deque
@@ -160,6 +185,24 @@ def _first_unvisited(urls: deque[UrlPathTuple], start: int) -> int:
             return i
     return next(
         (i for i, u in enumerate(islice(urls, near, None), near) if not u.visited),
+        len(urls),
+    )
+
+
+def _first_claimable(
+    urls: deque[UrlPathTuple],
+    leased: set[tuple[str, str]],
+    domain: str,
+    start: int = 0,
+) -> int:
+    """Return the index of the first unvisited URL without a live lease,
+    len(urls) if none."""
+    return next(
+        (
+            i
+            for i, u in enumerate(islice(urls, start, None), start)
+            if not u.visited and (domain, u.path()) not in leased
+        ),
         len(urls),
     )
 
@@ -206,6 +249,9 @@ class UrlStore:
         "urldict",
         "_hot",
         "_index",
+        "_lease_mode",
+        "_leased",
+        "_leases",
         "_lock",
         "_offset",
     )
@@ -217,6 +263,7 @@ class UrlStore:
         strict: bool = False,
         trailing_slash: bool = True,
         verbose: bool = False,
+        lease_mode: bool = False,
     ) -> None:
         self.compressed: bool = compressed
         self.done: bool = False
@@ -227,6 +274,11 @@ class UrlStore:
         # last written domain, kept uncompressed, and its path index
         self._hot: DomainEntry | None = None
         self._index: PathIndex | None = None
+        # opt-in lease mode: claims hand out tokens instead of marking URLs
+        self._lease_mode: bool = lease_mode
+        # token -> Lease, and the (domain key, path) pairs under a live lease
+        self._leases: dict[str, Lease] = {}
+        self._leased: set[tuple[str, str]] = set()
         self._lock: RLock = RLock()
         # rotating start of the download methods
         self._offset: int = 0
@@ -250,11 +302,13 @@ class UrlStore:
                 LOGGER.warning("Cannot set signal handlers outside the main thread")
 
     def __getstate__(self) -> dict[str, Any]:
-        "Return the picklable state, excluding the lock and the hot domain."
+        "Return the picklable state, excluding the lock, the hot domain and live leases."
         with self._lock:
             self._freeze()
             return {
-                slot: getattr(self, slot) for slot in self.__slots__ if slot != "_lock"
+                slot: getattr(self, slot)
+                for slot in self.__slots__
+                if slot not in ("_lock", "_leases", "_leased")
             }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -262,8 +316,14 @@ class UrlStore:
         self._hot = self._index = None
         self._lock = RLock()
         self._offset = 0
+        # leases never survive a reload: every pre-load token is invalid
+        self._leases = {}
+        self._leased = set()
         for slot, value in state.items():
             setattr(self, slot, value)
+        # older stores predate lease mode
+        if not hasattr(self, "_lease_mode"):
+            self._lease_mode = False
         # older stores use a defaultdict, whose reads create entries
         self.urldict = dict(self.urldict)
 
@@ -352,6 +412,34 @@ class UrlStore:
             self._hot = self._index = None
         entry.__init__(State.BUSTED)  # type: ignore[misc]
 
+    def _purge_leases(self, domain: str) -> None:
+        "Invalidate the live leases of a domain, e.g. before it is voided."
+        for token in [t for t, lease in self._leases.items() if lease.domain == domain]:
+            lease = self._leases.pop(token)
+            self._leased.discard((domain, lease.path))
+
+    def _rekey_leases(
+        self, source: str, target: str, index: PathIndex | None = None
+    ) -> None:
+        """Move the live leases of a merged twin onto the surviving key.
+        Paths follow slash-variant dedup and colliding leases are dropped."""
+        if not any(lease.domain == source for lease in self._leases.values()):
+            return
+        paths = index or self._paths(target)
+        for token in [t for t, lease in self._leases.items() if lease.domain == source]:
+            lease = self._leases.pop(token)
+            self._leased.discard((source, lease.path))
+            known = _lookup(lease.path, paths)
+            path = known.path() if known is not None else lease.path
+            key = (target, path)
+            if key in self._leased:
+                # the surviving twin already holds this URL: one valid lease only
+                continue
+            lease.domain = target
+            lease.path = path
+            self._leases[token] = lease
+            self._leased.add(key)
+
     def _update(self, entry: DomainEntry, urls: deque[UrlPathTuple]) -> None:
         "Refresh the counters and the state of an entry after a write."
         if entry.state is State.BUSTED:
@@ -372,6 +460,8 @@ class UrlStore:
         "Merge the source entry into the target one; a discarded twin voids the domain."
         tgt, src = self.urldict[target], self.urldict[source]
         if State.BUSTED in (tgt.state, src.state):
+            self._purge_leases(target)
+            self._purge_leases(source)
             self._bust(tgt)
             self._bust(src)
             return
@@ -381,6 +471,7 @@ class UrlStore:
             self._hot = self._index = None
         urls = self._live(target)
         _dedup_extend(urls, self._hot_index(), source_urls)
+        self._rekey_leases(source, target, self._hot_index())
         tgt.count += src.count
         if tgt.rules is None:
             tgt.rules = src.rules
@@ -402,7 +493,9 @@ class UrlStore:
             return https_key
         if domain == https_key and http_key in self.urldict:
             # upgrade the existing http entry to the https key
-            self.urldict[https_key] = self.urldict.pop(http_key)
+            entry = self.urldict.pop(http_key)
+            self.urldict[https_key] = entry
+            self._rekey_leases(http_key, https_key)
             return https_key
         return domain
 
@@ -485,7 +578,12 @@ class UrlStore:
         "Declare domains void and prune the store, http/https twins included."
         with self._lock:
             for domain in domains:
-                domain = self._merge_twin(_host_key(domain))
+                key = _host_key(domain)
+                # purge both twins before the merge deletes one of the keys
+                if key.startswith(("http://", "https://")):
+                    self._purge_leases(key)
+                    self._purge_leases(_swap_scheme(key))
+                domain = self._merge_twin(key)
                 self._bust(self.urldict.setdefault(domain, DomainEntry()))
             self._set_done()
         num = gc.collect()
@@ -496,6 +594,9 @@ class UrlStore:
         with self._lock:
             self.urldict = {}
             self._hot = self._index = None
+            # every outstanding token loses its target
+            self._leases = {}
+            self._leased = set()
         clear_caches()
         num = gc.collect()
         LOGGER.debug("UrlStore reset, %s objects in GC", num)
@@ -571,6 +672,11 @@ class UrlStore:
 
     def get_url(self, domain: str, as_visited: bool = True) -> str | None:
         "Retrieve a single URL and consider it to be visited (with corresponding timestamp)."
+        if self._lease_mode:
+            raise RuntimeError(
+                "consumption-style get_url() is disabled in lease mode, "
+                "use claim_url() and confirm_url()"
+            )
         with self._lock:
             return self._get_url(_host_key(domain), as_visited)
 
@@ -612,6 +718,11 @@ class UrlStore:
     ) -> list[str]:
         """Get a list of immediately downloadable URLs according to the given
         time limit per domain. Each call starts after the last domain served."""
+        if self._lease_mode:
+            raise RuntimeError(
+                "consumption-style get_download_urls() is disabled in lease mode, "
+                "use claim_download_urls()"
+            )
         with self._lock:
             urls: list[str] = []
             # snapshot the keys: _get_url may merge twin entries and mutate the dict
@@ -637,6 +748,11 @@ class UrlStore:
     ) -> list[tuple[float, str]]:
         """Get up to the specified number of URLs along with a suitable
         backoff schedule (in seconds). Each call starts after the last domain served."""
+        if self._lease_mode:
+            raise RuntimeError(
+                "consumption-style establish_download_schedule() is disabled "
+                "in lease mode, use claim_download_urls()"
+            )
         with self._lock:
             # see which domains are free
             potential = [
@@ -694,6 +810,147 @@ class UrlStore:
             # sort by first tuple element (time in secs)
             self._set_done()
             return sorted(targets, key=itemgetter(0))
+
+    # LEASES
+
+    def _sweep_leases(self, now: datetime, domain: str | None = None) -> None:
+        "Drop expired leases, making their URLs claimable again."
+        for token in [
+            t
+            for t, lease in self._leases.items()
+            if lease.is_expired(now) and (domain is None or lease.domain == domain)
+        ]:
+            lease = self._leases.pop(token)
+            self._leased.discard((lease.domain, lease.path))
+
+    def _claim_url(
+        self, key: str, duration: float, now: datetime
+    ) -> tuple[str, str] | None:
+        "Draw a claimable URL from a key already in stored form, None if none is free."
+        stored = self._find(key)
+        if stored is None:
+            return None
+        # merge any twin first so the writes below stay on one key
+        domain = self._merge_twin(stored)
+        entry = self.urldict[domain]
+        if entry.state is State.OPEN:
+            self._sweep_leases(now, domain)
+            urls = self._live(domain)
+            i = _first_claimable(urls, self._leased, domain)
+            if i < len(urls):
+                url = urls[i]
+                token = uuid4().hex
+                path = url.path()
+                self._leases[token] = Lease(
+                    token,
+                    domain,
+                    path,
+                    now + timedelta(seconds=duration),
+                )
+                self._leased.add((domain, path))
+                # the interval is timed from the claim, the URL stays unvisited
+                entry.count += 1
+                entry.timestamp = now
+                return domain + path, token
+        self._set_done()
+        return None
+
+    def claim_url(
+        self, domain: str, lease_duration: float = DEFAULT_LEASE_DURATION
+    ) -> tuple[str, str] | None:
+        """Claim a single URL of the domain without marking it visited.
+        Return the URL and an opaque token, or None if no URL is currently
+        claimable. Confirm the token once the fetch succeeds, or release it."""
+        if not self._lease_mode:
+            raise RuntimeError("claim_url() requires lease_mode=True")
+        with self._lock:
+            return self._claim_url(_host_key(domain), lease_duration, _now())
+
+    def claim_download_urls(
+        self,
+        time_limit: float = 10.0,
+        max_urls: int = 10000,
+        lease_duration: float = DEFAULT_LEASE_DURATION,
+    ) -> list[tuple[str, str]]:
+        """Claim immediately downloadable URLs with the same host rotation and
+        per-host interval as get_download_urls(). Each call starts after the
+        last host served and returns (URL, token) pairs."""
+        if not self._lease_mode:
+            raise RuntimeError("claim_download_urls() requires lease_mode=True")
+        with self._lock:
+            now = _now()
+            claims: list[tuple[str, str]] = []
+            # snapshot the keys: _claim_url may merge twin entries and mutate the dict
+            for position, website in self._rotated():
+                entry = self.urldict.get(website)
+                if entry is None or entry.state != State.OPEN:
+                    continue
+                if (
+                    not entry.timestamp
+                    or (now - entry.timestamp).total_seconds() > time_limit
+                ):
+                    claim = self._claim_url(website, lease_duration, now)
+                    if claim is not None:
+                        claims.append(claim)
+                        self._offset = position + 1
+                        if len(claims) >= max_urls:
+                            break
+            self._set_done()
+            return claims
+
+    def _invalidate(self, token: str, now: datetime) -> Lease | None:
+        "Remove a valid lease by token; expired or unknown tokens change nothing."
+        lease = self._leases.get(token)
+        if lease is None:
+            return None
+        if lease.is_expired(now):
+            self._leases.pop(token)
+            self._leased.discard((lease.domain, lease.path))
+            return None
+        self._leases.pop(token)
+        self._leased.discard((lease.domain, lease.path))
+        return lease
+
+    def confirm_url(self, token: str) -> bool:
+        """Mark the URL held by the token as visited.
+        Return False, without changing any state, on an unknown, duplicate or
+        expired token."""
+        if not self._lease_mode:
+            raise RuntimeError("confirm_url() requires lease_mode=True")
+        with self._lock:
+            now = _now()
+            lease = self._invalidate(token, now)
+            if lease is None:
+                return False
+            entry = self.urldict.get(lease.domain)
+            if entry is None or entry.state is State.BUSTED:
+                return False
+            urls = self._live(lease.domain)
+            known = _lookup(lease.path, self._hot_index())
+            if known is None:
+                return False
+            known.visited = True
+            self._update(entry, urls)
+            self._set_done()
+            return True
+
+    def release_url(self, token: str) -> bool:
+        """Give up a claim so its URL can be claimed again, the URL stays
+        unvisited. Return False, without changing any state, on an unknown,
+        duplicate or expired token."""
+        if not self._lease_mode:
+            raise RuntimeError("release_url() requires lease_mode=True")
+        with self._lock:
+            now = _now()
+            lease = self._invalidate(token, now)
+            if lease is None:
+                return False
+            # the in-flight URL belongs to the unvisited set again
+            entry = self.urldict.get(lease.domain)
+            if entry is not None and entry.state is State.ALL_VISITED:
+                entry.state = State.OPEN
+                self.done = False
+            return True
 
     # CRAWLING
 
