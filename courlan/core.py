@@ -4,6 +4,7 @@ Core functions needed to make the module work.
 
 import logging
 import re
+from collections.abc import Iterable
 from functools import lru_cache
 from urllib.parse import SplitResult
 from urllib.robotparser import RobotFileParser
@@ -27,6 +28,7 @@ from .filters import (
     validate_url,
 )
 from .hosts import _compared_host
+from .htmlparser import HtmlLinkParser
 from .network import redirection_test
 from .settings import BLACKLIST
 from .urlutils import (
@@ -188,7 +190,7 @@ def _check_url(
 
 
 def extract_links(
-    pagecontent: str,
+    pagecontent: str | Iterable[str],
     url: str | None = None,
     external_bool: bool = False,
     *,
@@ -200,11 +202,13 @@ def extract_links(
     redirects: bool = False,
     reference: str | None = None,
     base_url: str | None = None,
+    html_parser: bool = False,
 ) -> set[str]:
     """Filter links in a HTML document using a series of heuristics
 
     Args:
-        pagecontent: whole page as a string
+        pagecontent: whole page as a string; with html_parser=True, a
+            one-shot iterable of text chunks is also accepted
         url: full URL of the original page
         external_bool: set to True for external links only, False for
             internal links only
@@ -218,6 +222,12 @@ def extract_links(
         with_nav: set to True to include navigation pages instead of discarding them
         redirects: set to True for redirection test (per HTTP HEAD request)
         reference: provide a host reference for external/internal evaluation
+        html_parser: parse the HTML incrementally instead of using regular
+            expressions (default False). Handles attribute case and line
+            breaks, decodes character entities once, honors rel="nofollow"
+            word tokens and the first valid HTTP(S) <base href> for the
+            whole page, and skips comments and script/style content.
+            Internal/external evaluation still uses url/reference.
 
     Returns:
         A set containing filtered HTTP links checked for sanity and consistency.
@@ -241,24 +251,44 @@ def extract_links(
     ref_label = _compared_host(get_tldinfo(reference)[0]) if reference else None
 
     # extract links
-    for link in (m[0] for m in FIND_LINKS_REGEX.finditer(pagecontent)):
-        if "rel=" in link and "nofollow" in link:
-            continue
-        # https://en.wikipedia.org/wiki/Hreflang
-        if no_filter is False and language is not None and "hreflang" in link:
-            langmatch = HREFLANG_REGEX.search(link)
-            if langmatch and (
-                (lang := langmatch[1].lower()).startswith(language)
-                or lang == "x-default"
-            ):
+    if html_parser:
+        parser = HtmlLinkParser()
+        if isinstance(pagecontent, str):
+            parser.feed(pagecontent)
+        else:
+            for chunk in pagecontent:
+                parser.feed(chunk)
+        found, page_base = parser.close()
+        for href, hreflang in found:
+            # https://en.wikipedia.org/wiki/Hreflang
+            if no_filter is False and language is not None and hreflang is not None:
+                lang = hreflang.lower()
+                if not (lang.startswith(language) or lang == "x-default"):
+                    continue
+            candidates[href] = None
+        # a document base applies to the whole page, earlier links included
+        url = page_base or url
+    else:
+        if not isinstance(pagecontent, str):
+            raise TypeError("pagecontent must be a string unless html_parser=True")
+        for link in (m[0] for m in FIND_LINKS_REGEX.finditer(pagecontent)):
+            if "rel=" in link and "nofollow" in link:
+                continue
+            # https://en.wikipedia.org/wiki/Hreflang
+            if no_filter is False and language is not None and "hreflang" in link:
+                langmatch = HREFLANG_REGEX.search(link)
+                if langmatch and (
+                    (lang := langmatch[1].lower()).startswith(language)
+                    or lang == "x-default"
+                ):
+                    linkmatch = LINK_REGEX.search(link)
+                    if linkmatch:
+                        candidates[linkmatch[1]] = None
+            # default
+            else:
                 linkmatch = LINK_REGEX.search(link)
                 if linkmatch:
                     candidates[linkmatch[1]] = None
-        # default
-        else:
-            linkmatch = LINK_REGEX.search(link)
-            if linkmatch:
-                candidates[linkmatch[1]] = None
 
     # filter candidates
     for link in candidates:
@@ -294,7 +324,7 @@ def extract_links(
 
 
 def filter_links(
-    htmlstring: str,
+    htmlstring: str | Iterable[str],
     url: str | None,
     *,
     lang: str | None = None,
@@ -303,6 +333,7 @@ def filter_links(
     strict: bool = False,
     with_nav: bool = True,
     base_url: str | None = None,
+    html_parser: bool = False,
 ) -> tuple[list[str], list[str]]:
     "Find links in a HTML document, filter and prioritize them for crawling purposes."
 
@@ -318,6 +349,7 @@ def filter_links(
         language=lang,
         strict=strict,
         with_nav=with_nav,
+        html_parser=html_parser,
     ):
         # sanity check
         if is_not_crawlable(link) or (

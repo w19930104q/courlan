@@ -461,11 +461,12 @@ class UrlStore:
 
     def add_from_html(
         self,
-        htmlstring: str,
+        htmlstring: str | Iterable[str],
         url: str,
         external: bool = False,
         lang: str | None = None,
         with_nav: bool = True,
+        html_parser: bool = False,
     ) -> None:
         "Find links in a HTML document, filter them and add them to the data store."
         base_url = get_base_url(url)
@@ -478,6 +479,7 @@ class UrlStore:
             rules=rules,
             strict=self.strict,
             with_nav=with_nav,
+            html_parser=html_parser,
         )
         self.add_urls(urls=links, appendleft=links_priority)
 
